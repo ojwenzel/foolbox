@@ -65,3 +65,23 @@ from .iterative_projected_gradient import (
     AdamRandomProjectedGradientDescent,
     AdamRandomPGD,
 )
+
+from .imagecorruption import (
+    GaussianNoise,
+    ShotNoise,
+    ImpulseNoise,
+    DefocusBlur,
+    GlassBlur,
+    MotionBlur,
+    ZoomBlur,
+    Snow,
+    Frost,
+    Fog,
+    Brightness,
+    Contrast,
+    ElasticTransform,
+    Pixelate,
+    JpegCompression,
+    list_corruption_attack_names,
+    get_corruption_attacks
+)
