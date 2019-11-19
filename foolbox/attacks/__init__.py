@@ -75,3 +75,23 @@ L1PGD = L1ProjectedGradientDescentAttack
 L2PGD = L2ProjectedGradientDescentAttack
 LinfPGD = LinfProjectedGradientDescentAttack
 PGD = LinfPGD
+
+from .imagecorruption import (
+    GaussianNoise,
+    ShotNoise,
+    ImpulseNoise,
+    DefocusBlur,
+    GlassBlur,
+    MotionBlur,
+    ZoomBlur,
+    Snow,
+    Frost,
+    Fog,
+    Brightness,
+    Contrast,
+    ElasticTransform,
+    Pixelate,
+    JpegCompression,
+    list_corruption_attack_names,
+    get_corruption_attacks
+)
