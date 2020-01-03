@@ -1,6 +1,7 @@
 from functools import wraps
-from typing import List
+from typing import List, Union
 from warnings import warn
+import re
 
 import numpy as np
 
@@ -86,6 +87,12 @@ def corruption_name_2_cls_name(corruption_name: str) -> str:
     return ''.join([sub.capitalize() for sub in corruption_name.split('_')])
 
 
+def cls_name_2_corruption_name(cls_name: str):
+    """https://stackoverflow.com/questions/1175208/elegant-python-function-to-convert-camelcase-to-snake-case"""
+    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', cls_name)
+    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
+
 def get_subset(subset: List[str] = ['common']) -> List[str]:
     if 'common' in subset:
         return CORRUPTIONS[:15]
@@ -97,7 +104,7 @@ def get_subset(subset: List[str] = ['common']) -> List[str]:
         return validate_corruptions(subset)
 
 
-def list_corruption_attack_names(subset: List[str] = ['common']):
+def list_corruption_attack_names(subset: List[str] = ['common']) -> List[str]:
     """
 
     Retrieves class names for specified subset of corruption attacks. Note: identifiers 'common', 'all', 'validation'
@@ -177,6 +184,56 @@ def to_0_1_image(image: np.ndarray) -> np.ndarray:
     return (image / 255).astype('float32')
 
 
+def attack_decorator(corruption: str):
+
+    def outer_dec(func):
+
+        @wraps(func)
+        def inner_dec(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
+            x = a.unperturbed
+            severities = validate_severities(severities)
+
+            seed = x.sum().astype(int)
+
+            for _ in range(repetitions):
+                for s, severity in enumerate(severities):
+                    if not random:
+                        np.random.seed(seed + severity)
+                    perturbed = corrupt(x, corruption=corruption, severity=severity)
+
+                    if a.normalized_distance(perturbed) >= a.distance:
+                        continue
+
+                    _, is_adversarial = yield from a.forward_one(perturbed)
+                    if is_adversarial:
+                        break
+
+        return inner_dec
+    return outer_dec
+
+# def attack(a, corruption: str,  severities: List[int] = None, repetitions=10, random: bool = True):
+#
+#     x = a.unperturbed
+#     severities = validate_severities(severities)
+#
+#     seed = x.sum().astype(int)
+#
+#     print('seed value: {}'.format(seed))
+#
+#     for _ in range(repetitions):
+#         for s, severity in enumerate(severities):
+#             if not random:
+#                 np.random.seed(seed + severity)
+#             perturbed = corrupt(x, corruption=corruption, severity=severity)
+#
+#             if a.normalized_distance(perturbed) >= a.distance:
+#                 continue
+#
+#             _, is_adversarial = yield from a.forward_one(perturbed)
+#             if is_adversarial:
+#                 break
+
+
 # CLASSES
 class GaussianNoise(Attack):
     """Increases the amount of image corruption until the input is misclassified.
@@ -186,7 +243,8 @@ class GaussianNoise(Attack):
     CORRUPTION = 'gaussian_noise'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed: int = None):
+    @attack_decorator('gaussian_noise')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -206,26 +264,9 @@ class GaussianNoise(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
         """
-        # print('seed: {}'.format(seed))
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -239,7 +280,8 @@ class ShotNoise(Attack):
     CORRUPTION = 'shot_noise'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('gaussian_noise')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -259,26 +301,12 @@ class ShotNoise(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
 
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
+        attack(a=a, corruption=self.CORRUPTION, severities=severities, repetitions=repetitions, random=random)
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -292,7 +320,8 @@ class ImpulseNoise(Attack):
     CORRUPTION = 'impulse_noise'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('impulse_noise')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -312,26 +341,10 @@ class ImpulseNoise(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -345,7 +358,8 @@ class DefocusBlur(Attack):
     CORRUPTION = 'defocus_blur'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('defocus_blur')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -365,26 +379,10 @@ class DefocusBlur(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -398,7 +396,8 @@ class GlassBlur(Attack):
     CORRUPTION = 'glass_blur'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('glass_blur')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -418,26 +417,10 @@ class GlassBlur(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -451,7 +434,8 @@ class MotionBlur(Attack):
     CORRUPTION = 'motion_blur'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('motion_blur')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -471,26 +455,10 @@ class MotionBlur(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -504,7 +472,8 @@ class ZoomBlur(Attack):
     CORRUPTION = 'zoom_blur'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('zoom_blur')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -524,26 +493,10 @@ class ZoomBlur(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -557,7 +510,8 @@ class Snow(Attack):
     CORRUPTION = 'snow'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('snow')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -577,26 +531,10 @@ class Snow(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -610,7 +548,8 @@ class Frost(Attack):
     CORRUPTION = 'frost'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('frost')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -630,26 +569,10 @@ class Frost(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -663,7 +586,8 @@ class Fog(Attack):
     CORRUPTION = 'fog'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('fog')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -683,26 +607,10 @@ class Fog(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -716,7 +624,8 @@ class Brightness(Attack):
     CORRUPTION = 'brightness'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('brightness')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -736,26 +645,10 @@ class Brightness(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -769,7 +662,8 @@ class Contrast(Attack):
     CORRUPTION = 'contrast'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('contrast')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -789,26 +683,10 @@ class Contrast(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -822,7 +700,8 @@ class ElasticTransform(Attack):
     CORRUPTION = 'elastic_transform'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('elastic_transform')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -842,26 +721,10 @@ class ElasticTransform(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -875,7 +738,8 @@ class Pixelate(Attack):
     CORRUPTION = 'pixelate'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('pixelate')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -895,26 +759,10 @@ class Pixelate(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
@@ -928,7 +776,8 @@ class JpegCompression(Attack):
     CORRUPTION = 'jpeg_compression'
 
     @generator_decorator
-    def as_generator(self, a, severities: List[int] = None, repetitions=10, seed=None):
+    @attack_decorator('jpeg_compression')
+    def as_generator(self, a, severities: List[int] = None, repetitions=10, random: bool = True):
 
         """Increases the amount of specified image corruption until the input is misclassified.
 
@@ -948,26 +797,10 @@ class JpegCompression(Attack):
             severity-strengths of attack
         repetitions : int
             Specifies how often the attack will be repeated.
-        seed : int
-            sets a seed for reproducibility
+        random : bool
+            if False an image and corruption severity specific seed is set for reproducibility
 
         """
-
-        x = a.unperturbed
-        severities = validate_severities(severities)
-
-        for _ in range(repetitions):
-            for s, severity in enumerate(severities):
-                if seed is not None:
-                    np.random.seed(seed)
-                perturbed = corrupt(x, corruption=self.CORRUPTION, severity=severity)
-
-                if a.normalized_distance(perturbed) >= a.distance:
-                    continue
-
-                _, is_adversarial = yield from a.forward_one(perturbed)
-                if is_adversarial:
-                    break
 
     def __str__(self):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
