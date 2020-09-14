@@ -75,6 +75,22 @@ def test_pytorch_invalid_model(request: Any) -> None:
         fbn.PyTorchModel(model, bounds=bounds)
 
 
+def test_jax_no_data_format(request: Any) -> None:
+    backend = request.config.option.backend
+    if backend != "jax":
+        pytest.skip()
+
+    class Model:
+        def __call__(self, x: Any) -> Any:
+            return x
+
+    model = Model()
+    bounds = (0, 1)
+    fmodel = fbn.JAXModel(model, bounds, data_format=None)
+    with pytest.raises(AttributeError):
+        fmodel.data_format
+
+
 @pytest.mark.parametrize("bounds", [(0, 1), (-1.0, 1.0), (0, 255), (-32768, 32767)])
 def test_transform_bounds(
     fmodel_and_data: ModelAndData, bounds: fbn.types.BoundsInput
@@ -218,3 +234,38 @@ def test_preprocessing(fmodel_and_data: ModelAndData) -> None:
         fmodel = fbn.models.base.ModelWithPreprocessing(
             fmodel._model, fmodel.bounds, fmodel.dummy, preprocessing
         )
+
+
+def test_transform_bounds_wrapper_data_format() -> None:
+    class Model(fbn.models.Model):
+        data_format = "channels_first"
+
+        @property
+        def bounds(self) -> fbn.types.Bounds:
+            return fbn.types.Bounds(0, 1)
+
+        def __call__(self, inputs: fbn.models.base.T) -> fbn.models.base.T:
+            return inputs
+
+    model = Model()
+    wrapped_model = fbn.models.TransformBoundsWrapper(model, (0, 1))
+    assert fbn.attacks.base.get_channel_axis(
+        model, 3
+    ) == fbn.attacks.base.get_channel_axis(wrapped_model, 3)
+    assert hasattr(wrapped_model, "data_format")
+    assert not hasattr(wrapped_model, "not_data_format")
+
+
+def test_transform_bounds_wrapper_missing_data_format() -> None:
+    class Model(fbn.models.Model):
+        @property
+        def bounds(self) -> fbn.types.Bounds:
+            return fbn.types.Bounds(0, 1)
+
+        def __call__(self, inputs: fbn.models.base.T) -> fbn.models.base.T:
+            return inputs
+
+    model = Model()
+    wrapped_model = fbn.models.TransformBoundsWrapper(model, (0, 1))
+    assert not hasattr(wrapped_model, "data_format")
+    assert not hasattr(wrapped_model, "not_data_format")
