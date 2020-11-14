@@ -1,5 +1,5 @@
 from functools import wraps, partial
-from typing import List, Union, Any, Callable, Optional, Tuple, Iterable
+from typing import List, Union, Any, Callable, Optional, Tuple, Iterable, Sequence
 from typing_extensions import final, overload
 from warnings import warn
 import re
@@ -19,13 +19,14 @@ from ..devutils import atleast_kd
 
 from ..distances import l2, linf
 
-from .base import SeverityAttack, AttackWithDistance
+from .base import AttackWithDistance, Attack
 from .base import Criterion
 from .base import Model
 from .base import T
 from .base import get_criterion
 from .base import get_is_adversarial
 from .base import raise_if_kwargs
+from ..criteria import TargetedMisclassification
 
 import imagecorruptions
 
@@ -45,6 +46,10 @@ CORRUPTIONS = ['gaussian_noise', 'shot_noise', 'impulse_noise', 'defocus_blur', 
 
 
 # FUNCTIONS
+def logical_xor(a: ep.Tensor, b: ep.Tensor) -> ep.Tensor:
+    not_a, not_b = ep.logical_not(a), ep.logical_not(b)
+    return ep.logical_or(ep.logical_and(a, b), ep.logical_and(not_a, not_b))
+
 def validate_corruptions(corruptions: Tuple[str, ...]) -> List[str]:
     """
 
@@ -184,7 +189,7 @@ def ep_np_ep_conversion_decorator(func: Callable) -> Callable[[ep.Tensor], ep.Te
 # @ep_np_ep_conversion_decorator
 @image_value_range_decorator
 @image_transpose_decorator
-def corrupt(image: np.ndarray, corruption: str, severity: int, seed: Optional[int] = None) -> np.ndarray:
+def corrupt(image: np.ndarray, seed: Optional[int], corruption: str, severity: int) -> np.ndarray:
 
     if severity == 0:
         return image
@@ -197,7 +202,11 @@ def corrupt(image: np.ndarray, corruption: str, severity: int, seed: Optional[in
     return corrupted_image 
 
 
-def corrupt_images(images: ep.Tensor, corruption: str, severity: int, num_workers: int = 1, random: bool = False):
+def corrupt_images(images: ep.Tensor,
+                   corruption: str,
+                   severity: int,
+                   num_workers: int = 1,
+                   random: bool = True) -> ep.Tensor:
     """
 
     :param images: ep.Tensor
@@ -205,6 +214,7 @@ def corrupt_images(images: ep.Tensor, corruption: str, severity: int, num_worker
     :param corruption: str
     :param severity:
     :param num_workers:
+    :param
     :return:
     """
 
@@ -216,28 +226,27 @@ def corrupt_images(images: ep.Tensor, corruption: str, severity: int, num_worker
         raise ValueError('Images must be ndarray of dimensionality 4.')
 
     corrupt_func = partial(corrupt, corruption=corruption, severity=severity)
-    seeds = images.sum(axis=(1, 2, 3,)) + severity
+    seeds = images.sum(axis=(1, 2, 3,)).numpy().astype(int) + severity
     if random:
-        seeds = torch.randint(0, seeds.max()[0], size=seeds.shape)
-    seeds = seeds.tolist()
+        seeds = [None] * len(images)
 
-    images = images.numpy()
+    images, restore_type = ep.astensor_(images)
+    np_images = images.numpy()
     try:
         torch.multiprocessing.set_start_method('spawn', force=True)
         with Pool(num_workers) as p:
-            corrupted_images = p.map(corrupt_func, zip(images, seeds), )
+            corrupted_images = p.starmap(corrupt_func, zip(np_images, seeds), )
 
     except RuntimeError:
         warn('RuntimeError when attempting parallel image corruption. Corrupting Sequentially.')
         corrupted_images = []
-        for image, seed in images:
+        for image, seed in zip(np_images, seeds):
             corrupted_images.append(corrupt_func(image, seed))
 
     # corrupted_images = []
     # for image in images:
     #     corrupted_images.append(corrupt_func(image))
-
-    corrupted_images = [ep.astensor(img) for img in corrupted_images]
+    corrupted_images = [ep.from_numpy(restore_type(images), img) for img in corrupted_images]
 
     return ep.stack(corrupted_images)
 
@@ -251,154 +260,179 @@ def to_0_1_image(image: np.ndarray) -> np.ndarray:
 
 
 # CLASSES
-class SeverityAttack(AttackWithDistance):
-    """Severity attacks try to find adversarials whose perturbation sizes are given by a set of integers"""
+class IntegerIntensityAttack(ABC):
 
     @abstractmethod
     def run(
-        self, model: Model, inputs: T, criterion: Any, *, severity: float, **kwargs: Any
-    ) -> T:
+            self, model: Model, inputs: T, criterion: Any, *, severities: Iterable[int], **kwargs: Any
+    ) -> Tuple[T, T]:
         """Runs the attack and returns perturbed inputs.
 
-        The size of the perturbations should be at most severity, but this
+        The size of the perturbations should be at most epsilon, but this
         is not guaranteed and the caller should verify this or clip the result.
         """
         ...
 
-    @overload
     def __call__(
-        self,
-        model: Model,
-        inputs: T,
-        criterion: Any,
-        *,
-        epsilons: Sequence[Union[float, None]],
-        **kwargs: Any,
-    ) -> Tuple[List[T], List[T], T]:
-        ...
-
-    @overload  # noqa: F811
-    def __call__(
-        self,
-        model: Model,
-        inputs: T,
-        criterion: Any,
-        *,
-        epsilons: Union[float, None],
-        **kwargs: Any,
+            self,
+            model: Model,
+            inputs: T,
+            criterion: Any,
+            *,
+            severities: Union[Sequence[int], None],
+            **kwargs: Any,
     ) -> Tuple[T, T, T]:
-        ...
-
-    @final  # noqa: F811
-    def __call__(  # type: ignore
-        self,
-        model: Model,
-        inputs: T,
-        criterion: Any,
-        *,
-        epsilons: Union[Sequence[Union[float, None]], float, None],
-        **kwargs: Any,
-    ) -> Union[Tuple[List[T], List[T], T], Tuple[T, T, T]]:
-
         x, restore_type = ep.astensor_(inputs)
         del inputs
 
         criterion = get_criterion(criterion)
         is_adversarial = get_is_adversarial(criterion, model)
 
-        was_iterable = True
-        if not isinstance(epsilons, Iterable):
-            epsilons = [epsilons]
-            was_iterable = False
+        if severities is None:
+            raise NotImplementedError(
+                "IntegerIntensityAttack subclasses do not yet support severity None"
+            )
+
+        xp, distances = self.run(model, x, criterion, severities=severities, **kwargs)
+        success = is_adversarial(xp)
+
+        xp_ = restore_type(xp)
+
+        return xp_, restore_type(success), restore_type(distances)
+
+    @abstractmethod
+    def repeat(self, times: int) -> "IntegerIntensityAttack":
+        ...
+
+    def __repr__(self) -> str:
+        args = ", ".join(f"{k.strip('_')}={v}" for k, v in vars(self).items())
+        return f"{self.__class__.__name__}({args})"
+
+
+class RepeatedIntegerIntensityAttack(IntegerIntensityAttack):
+    """Repeats the wrapped attack and returns the best result"""
+
+    def __init__(self, attack: IntegerIntensityAttack, times: int):
+        if times < 1:
+            raise ValueError(f"expected times >= 1, got {times}")  # pragma: no cover
+
+        self.attack: IntegerIntensityAttack = attack
+        self.times: int = times
+
+    def __call__(  # noqa: F811
+            self,
+            model: Model,
+            inputs: T,
+            criterion: TargetedMisclassification,
+            *,
+            severities: Union[Sequence[int], int, None],
+            check_trivial: bool = True,
+            **kwargs: Any,
+    ) -> Tuple[T, T, T]:
+        x, restore_type = ep.astensor_(inputs)
+        del inputs
+
+        target_classes = criterion.target_classes
+        criterion_ = get_criterion(criterion)
+        is_adversarial = get_is_adversarial(criterion_, model)
+
+        if not isinstance(severities, Iterable):
+            severities = [severities]
 
         N = len(x)
-        K = len(epsilons)
+        K = len(severities)
 
-        # None means: just minimize, no early stopping, no limit on the perturbation size
-        if any(eps is None for eps in epsilons):
-            # TODO: implement a binary search
-            raise NotImplementedError(
-                "SeverityAttack subclasses do not yet support None in epsilons"
-            )
-        real_epsilons = [eps for eps in epsilons if eps is not None]
-        del epsilons
-
-        xps = []
-        xpcs = []
-        success = []
-        for epsilon in real_epsilons:
-            xp = self.run(model, x, criterion, severity=epsilon, **kwargs)
-
-            # clip to severity because we don't really know what the attack returns;
-            # alternatively, we could check if the perturbation is at most severity,
-            # but then we would need to handle numerical violations;
-            xpc = self.distance.clip_perturbation(x, xp, epsilon)
-            is_adv = is_adversarial(xp)
-
-            xps.append(xp)
-            xpcs.append(xpc)
-            success.append(is_adv)
-
-        # # TODO: the correction we apply here should make sure that the limits
-        # # are not violated, but this is a hack and we need a better solution
-        # # Alternatively, maybe can just enforce the limits in __call__
-        # xps = [
-        #     self.run(model, x, criterion, severity=severity, **kwargs)
-        #     for severity in real_epsilons
-        # ]
-
-        # is_adv = ep.stack([is_adversarial(xp) for xp in xps])
-        # assert is_adv.shape == (K, N)
-
-        # in_limits = ep.stack(
-        #     [
-        #         self.distance(x, xp) <= severity
-        #         for xp, severity in zip(xps, real_epsilons)
-        #     ],
-        # )
-        # assert in_limits.shape == (K, N)
-
-        # if not in_limits.all():
-        #     # TODO handle (numerical) violations
-        #     # warn user if run() violated the severity constraint
-        #     import pdb
-
-        #     pdb.set_trace()
-
-        # success = ep.logical_and(in_limits, is_adv)
-        # assert success.shape == (K, N)
-
-        success_ = ep.stack(success)
-        assert success_.shape == (K, N)
-
-        xps_ = [restore_type(xp) for xp in xps]
-        xpcs_ = [restore_type(xpc) for xpc in xpcs]
-
-        if was_iterable:
-            return xps_, xpcs_, restore_type(success_)
+        result = x
+        if check_trivial:
+            found = is_adversarial(result)
         else:
-            assert len(xps_) == 1
-            assert len(xpcs_) == 1
-            return xps_[0], xpcs_[0], restore_type(success_.squeeze(axis=0))
+            found = ep.zeros(x, len(result)).bool()
+        result_distance = -1 * ep.where(found, 0., ep.nan)  # 0: trivial adversarial, nan: no adversarial
+
+        for i in range(self.times):
+
+            if found.all():
+                break
+
+            # run the attack
+            criterion_ = criterion
+            criterion_.target_classes = target_classes[ep.logical_not(found)]
+            is_adversarial = get_is_adversarial(criterion_, model)
+            xps, distance = self.run(
+                model, x[ep.logical_not(found)], criterion_, severities=severities, **kwargs
+            )
+
+            success = is_adversarial(xps)
+
+            n = ep.logical_not(found).sum()
+            assert len(xps) == n
+            assert success.shape == (n,)
+            assert distance.shape == (n,)
+            assert attack.shape == (n,)
+
+            # upscale new successes
+            is_adv = np.zeros_like(found, dtype=np.bool)
+            is_adv[ep.logical_not(found).numpy()] = success.numpy()
+            is_adv = ep.from_numpy(restore_type(found), is_adv)
+            is_new_adv = ep.logical_and(is_adv, ep.logical_not(found))
+
+            # upscale adversarial examples
+            xps_ = np.zeros_like(x.numpy())
+            xps_[is_adv.numpy()] = xps[success.bool()].numpy()
+            xps_ = ep.from_numpy(restore_type(found), xps_)
+
+            # upscale new distances
+            new_distances = np.ones_like(is_new_adv.numpy(), dtype='float32') * np.nan
+            new_distances[ep.logical_not(found).numpy()] = distance.numpy()
+            new_distances = ep.from_numpy(found, new_distances)
+
+            result = ep.where(atleast_kd(is_new_adv, xps_.ndim), xps_, result)
+            result_distance = ep.where(atleast_kd(is_new_adv, distance.ndim),
+                                       new_distances,
+                                       result_distance)
+            found = ep.logical_or(found, is_adv)
+
+        result = restore_type(result)
+        result_distance = restore_type(result_distance)
+
+        return result, restore_type(found), result_distance
+
+    def run(self,
+            model: Model,
+            inputs: T,
+            criterion: TargetedMisclassification,
+            *,
+            severities: Sequence[int],
+            **kwargs) -> Tuple[T, T]:
+
+        adv, _, distance = self.attack(
+            model, inputs, criterion, epsilons=severities, **kwargs
+        )
+
+        return adv, distance
+
+    def repeat(self, times: int) -> "RepeatedIntegerIntensityAttack":
+        return RepeatedIntegerIntensityAttack(self.attack, self.times * times)
 
 
-class BaseImageCorruptionAttack(SeverityAttack, ABC):
+class ImageCorruptionAttack(IntegerIntensityAttack, ABC):
     def run(
         self,
         model: Model,
         inputs: T,
         criterion: Union[Criterion, Any] = None,
         *,
-        epsilon: int,
+        severities: Sequence[int],
         **kwargs: Any,
-    ) -> T:
+    ) -> Tuple[T, T]:
         # raise_if_kwargs(kwargs)
         x, restore_type = ep.astensor_(inputs)
         criterion_ = get_criterion(criterion)
 
-        repeats: int = 1 if not self.stochastic else kwargs.pop('repeats', 1)
+        # repeats: int = 1 if not self.stochastic else kwargs.pop('repeats', 1)
         num_workers: int = max([1, kwargs.pop('num_workers', 1)])
         check_trivial: bool = kwargs.pop('check_trivial', False)
+        random: bool = kwargs.pop('random', True)
 
         del criterion, kwargs, inputs
 
@@ -409,57 +443,48 @@ class BaseImageCorruptionAttack(SeverityAttack, ABC):
             found = is_adversarial(result)
         else:
             found = ep.zeros(x, len(result)).bool()
+        distance = ep.zeros_like(found).astype(int)
 
-        for _ in range(repeats):
+        for s, severity in enumerate(severities):
+
             if found.all():
                 break
-            # min_, max_ = model.bounds
-            adv = self.sample_imagecorruption_noise(images=x, severity=epsilon, num_workers=num_workers)
-            # norms = self.get_norms(adv - x)
-            # p = p / atleast_kd(norms, p.ndim)
-            # x = x + severity * p
-            # x = x.clip(min_, max_)
-            # if not isinstance(x, adv.__class__):
-            #     if isissh aorakinstance(adv, (NumPyTensor, PyTorchTensor)):
-            #         adv_list = adv.raw.tolist()
-            #     else:
-            #         raise NotImplementedError
-            #     adv = type(x)(adv_list)
 
-            adv = restore_type(adv)
-            adv = ep.astensor(torch.from_numpy(adv.raw).to(model.device))
+            adv = self.sample_imagecorruption_noise(images=x[ep.logical_not(found)], severity=severity,
+                                                    num_workers=num_workers, random=random)
 
-            is_adv = is_adversarial(adv)
+            is_adv = np.zeros_like(found, dtype=np.bool)
+            is_adv[ep.logical_not(found).numpy()] = is_adversarial(adv).numpy()
+            is_adv = ep.from_numpy(restore_type(found), is_adv)
             is_new_adv = ep.logical_and(is_adv, ep.logical_not(found))
+
             result = ep.where(atleast_kd(is_new_adv, adv.ndim), adv, result)
+            distance = ep.where(atleast_kd(is_new_adv, distance.ndim), ep.ones_like(distance) * severity, distance)
             found = ep.logical_or(found, is_adv)
 
         result = restore_type(result)
+        distance = restore_type(distance)
 
-        return result
-
-    @abstractmethod
-    def sample_imagecorruption_noise(self, x: ep.Tensor, severity: int) -> ep.Tensor:
-        raise NotImplementedError
+        return result, distance
 
     @abstractmethod
-    def get_norms(self, p: ep.Tensor) -> ep.Tensor:
+    def sample_imagecorruption_noise(self,
+                                     images: ep.Tensor,
+                                     severity: int,
+                                     num_workers: int = 1,
+                                     random: bool = True) -> ep.Tensor:
         raise NotImplementedError
 
     @property
     @abstractmethod
     def stochastic(self) -> bool:
-        NotImplementedError
+        pass
+
+    def repeat(self, times: int) -> "IntegerIntensityAttack":
+        return RepeatedIntegerIntensityAttack(attack=self, times=times)
 
 
-class L2Mixin:
-    distance = l2
-
-    def get_norms(self, p: ep.Tensor) -> ep.Tensor:
-        return flatten(p).norms.l2(axis=-1)
-
-
-class GaussianNoise(L2Mixin, BaseImageCorruptionAttack):
+class GaussianNoise(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -476,7 +501,7 @@ class GaussianNoise(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class ShotNoise(L2Mixin, BaseImageCorruptionAttack):
+class ShotNoise(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -493,7 +518,7 @@ class ShotNoise(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class ImpulseNoise(L2Mixin, BaseImageCorruptionAttack):
+class ImpulseNoise(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -510,7 +535,7 @@ class ImpulseNoise(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class DefocusBlur(L2Mixin, BaseImageCorruptionAttack):
+class DefocusBlur(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -527,7 +552,7 @@ class DefocusBlur(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class GlassBlur(L2Mixin, BaseImageCorruptionAttack):
+class GlassBlur(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -544,7 +569,7 @@ class GlassBlur(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class MotionBlur(L2Mixin, BaseImageCorruptionAttack):
+class MotionBlur(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -561,7 +586,7 @@ class MotionBlur(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class ZoomBlur(L2Mixin, BaseImageCorruptionAttack):
+class ZoomBlur(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -578,7 +603,7 @@ class ZoomBlur(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class Snow(L2Mixin, BaseImageCorruptionAttack):
+class Snow(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -595,7 +620,7 @@ class Snow(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class Frost(L2Mixin, BaseImageCorruptionAttack):
+class Frost(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -612,7 +637,7 @@ class Frost(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class Fog(L2Mixin, BaseImageCorruptionAttack):
+class Fog(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -629,7 +654,7 @@ class Fog(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class Brightness(L2Mixin, BaseImageCorruptionAttack):
+class Brightness(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -646,7 +671,7 @@ class Brightness(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class Contrast(L2Mixin, BaseImageCorruptionAttack):
+class Contrast(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -663,7 +688,7 @@ class Contrast(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class ElasticTransform(L2Mixin, BaseImageCorruptionAttack):
+class ElasticTransform(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -680,7 +705,7 @@ class ElasticTransform(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class Pixelate(L2Mixin, BaseImageCorruptionAttack):
+class Pixelate(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -697,7 +722,7 @@ class Pixelate(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class JpegCompression(L2Mixin, BaseImageCorruptionAttack):
+class JpegCompression(ImageCorruptionAttack):
     """Increases the amount of image corruption until the input is misclassified.
 
     """
@@ -714,34 +739,68 @@ class JpegCompression(L2Mixin, BaseImageCorruptionAttack):
         return 'Corruption attack of type \'{}\''.format(self.CORRUPTION)
 
 
-class RotateImageCorruptionsAttack(L2Mixin, BaseImageCorruptionAttack):
+class RotateImageCorruptionsAttack:
     """Increases the amount of image corruption until the input is misclassified.
 
     """
 
-    self._attacks: Optional[List[BaseImageCorruptionAttack]] = None
+    def __init__(self, attacks: Tuple[ImageCorruptionAttack]):
+        self.attacks: Sequence[ImageCorruptionAttack] = attacks
+
+    def __call__(
+            self,
+            model: Model,
+            inputs: T,
+            criterion: TargetedMisclassification,
+            *,
+            severities: Union[Sequence[int], None],
+            attack_permutation: Optional[torch.tensor] = None,
+            **kwargs: Any,
+    ) -> Tuple[T, T, T, T]:
+
+        x, restore_type = ep.astensor_(inputs)
+        target_classes = criterion.target_classes
+        kwargs['attack_permutation'] = attack_permutation
+        del inputs
+
+        if severities is None:
+            raise NotImplementedError(
+                "IntegerIntensityAttack subclasses do not yet support severity None"
+            )
+
+        xp, success, distances, attacks = self.run(model, x, criterion, severities=severities, **kwargs)
+
+        criterion.target_classes = target_classes
+        criterion_ = get_criterion(criterion)
+        is_adversarial = get_is_adversarial(criterion_, model)
+        assert logical_xor(success, is_adversarial(xp)).all()
+        # success = is_adversarial(xp)
+
+        xp_ = restore_type(xp)
+
+        return (xp_,
+                restore_type(success),
+                restore_type(distances),
+                restore_type(attacks), )
 
     def run(
         self,
         model: Model,
         inputs: T,
-        criterion: Union[Criterion, Any] = None,
+        criterion: TargetedMisclassification,
         *,
-        epsilon: int,
+        severities: Sequence[int],
         **kwargs: Any,
-    ) -> T:
+    ) -> Tuple[T, T, T, T]:
         # raise_if_kwargs(kwargs)
         x, restore_type = ep.astensor_(inputs)
         criterion_ = get_criterion(criterion)
 
         num_workers: int = max([1, kwargs.pop('num_workers', 1)])
-        repeats: int = kwargs.pop('repeats', 1)
-        attacks = self.attacks
-        shuffle(attacks)
-        num_attacks: int = len(attacks)
         check_trivial: bool = kwargs.pop('check_trivial', False)
+        attack_permutation: Optional[torch.tensor] = kwargs.pop('attack_permutation', None)
 
-        del criterion, kwargs, inputs
+        del kwargs, inputs
 
         is_adversarial = get_is_adversarial(criterion_, model)
 
@@ -750,67 +809,225 @@ class RotateImageCorruptionsAttack(L2Mixin, BaseImageCorruptionAttack):
             found = is_adversarial(result)
         else:
             found = ep.zeros(x, len(result)).bool()
+        # print(f'input, shape: {result.shape}')
+        # print(f'found, shape: {found.shape}, number found: {found.sum().item()}')
+        result_attack = -1 * ep.where(found, -1., ep.nan)  # -1: trivial adversarial, nan: no adversarial
+        result_distance = -1 * ep.where(found, 0., ep.nan)  # 0: trivial adversarial, nan: no adversarial
+        target_classes = criterion.target_classes[ep.logical_not(found)]
 
-        for _ in range(repeats):
+        # shuffle attacks for each image
+        num_attacks = len(self.attacks)
+        # print(f'attack permutation, shape: {attack_permutation.shape}')
+        attacks = attack_permutation
+        if attack_permutation is None:
+            attacks = ep.from_numpy(restore_type(found),
+                                    np.stack([np.random.permutation(num_attacks) for _ in range(len(x))]))
+
+        for s, severity in enumerate(severities):
+
             if found.all():
                 break
-            # norms = self.get_norms(adv - x)
-            # p = p / atleast_kd(norms, p.ndim)
-            # x = x + severity * p
-            # x = x.clip(min_, max_)
-            # if not isinstance(x, adv.__class__):
-            #     if isissh aorakinstance(adv, (NumPyTensor, PyTorchTensor)):
-            #         adv_list = adv.raw.tolist()
-            #     else:
-            #         raise NotImplementedError
-            #     adv = type(x)(adv_list)
 
-            # ALLOCATION
-            advs = ep.zeros_like(x)
-            found = ep.astensor(torch.zeros(advs.shape[0], dtype=torch.bool))
-            successful_attack = -1 * ep.ones_like(found).int()
-
-            for a, attack in enumerate(attacks):
+            for a_i in range(num_attacks):
 
                 if found.all():
                     break
 
-                [adv, _, success] = attack(model,
-                                           x[~found],
-                                           criterion_,
-                                           epsilons=[epsilon],  # always only one severity!
-                                           repeats=repeats,
-                                           num_workers=num_workers)
+                # select attack index for each image
+                attack_idx = attacks[:, a_i]
 
-                assert success.ndim == 1, f"Expected success to have dimensionality 1, got {success.ndim}"
+                for a_j in range(num_attacks):
 
-                # attack those images, that have not been successfully attacked yet
-                new_successes = torch.zeros_like(found, dtype=torch.bool)
-                new_successes[~found] = success
+                    if found.all():
+                        break
 
-                advs[new_successes] = torch.cat(adv, dim=0)[success]
-                successful_attack[new_successes] = a
-                found[new_successes] = True
+                    attack = self.attacks[a_j]
 
-            advs = restore_type(advs)
+                    # select images for which no adversarial has been found yet and shall be attacked with attack a_j, now
+                    # print(f'a_i: {a_i}', f'a_j: {a_j}\n',
+                    #       f'severity: {severity}\n',
+                    #       f'attack selection, shape: {(attack_idx == a_j).shape}, selected: {(attack_idx == a_j).sum().item()}\n',
+                    #       f'not found, shape: {ep.logical_not(found).shape}, number not found: {ep.logical_not(found).sum().item()}')
+                    selection = ep.logical_and(attack_idx == a_j, ep.logical_not(found))
 
-            is_adv = is_adversarial(advs)
-            is_new_adv = ep.logical_and(is_adv, ep.logical_not(found))
-            result = ep.where(atleast_kd(is_new_adv, advs.ndim), advs, result)
-            found = ep.logical_or(found, is_adv)
+                    criterion.target_classes = target_classes[selection]
+                    [adv, _, success] = attack(model,
+                                               x[selection],
+                                               criterion,
+                                               severities=[severity],  # always only one severity!
+                                               num_workers=num_workers)
+
+                    assert success.ndim == 1, f"Expected success to have dimensionality 1, got {success.ndim}"
+
+                    adv = restore_type(adv)
+
+                    # Use numpy to map currently, sucessfully attacked images back to the set of all images.
+                    # Since ep.Tensor does not allow assignment, we perform the mapping with numpy tensors and convert
+                    # back to ep tensors thereafter.
+                    is_adv = np.zeros_like(found, dtype=np.bool)
+                    is_adv[selection.numpy()] = success.bool().numpy()
+                    is_adv = ep.from_numpy(restore_type(found), is_adv)
+                    is_new_adv = ep.logical_and(is_adv, ep.logical_not(found))
+
+                    advs = np.zeros_like(x.numpy())
+                    advs[is_adv.numpy()] = adv[success.bool()].numpy()
+                    advs = ep.from_numpy(restore_type(found), advs)
+
+                    result = ep.where(atleast_kd(is_new_adv, advs.ndim), advs, result)
+                    result_attack = ep.where(atleast_kd(is_new_adv, result_attack.ndim),
+                                             ep.ones_like(result_attack) * a_j, result_attack)
+                    result_distance = ep.where(atleast_kd(is_new_adv, result_distance.ndim),
+                                               ep.ones_like(result_distance) * severity, result_distance)
+                    found = ep.logical_or(found, is_adv)
+
+        result_attack = ep.where(found, result_attack, ep.nan * ep.ones_like(result_attack))
+        result_distance = ep.where(found, result_distance, ep.nan * ep.ones_like(result_distance))
 
         result = restore_type(result)
 
-        return result
+        return result, restore_type(found), restore_type(result_distance), restore_type(result_attack)
 
-    @property
-    def attacks(self) -> List[BaseImageCorruptionAttack]:
-        if self._attacks is None:
-            self._attacks = get_corruption_attacks('all')
-        return self._attacks
+    @abstractmethod
+    def repeat(self, times: int) -> "RepeatedRotateImageCorruptionsAttack":
+        return RepeatedRotateImageCorruptionsAttack(attack=self, times=times)
+
+    def __repr__(self) -> str:
+        args = ", ".join(f"{k.strip('_')}={v}" for k, v in vars(self).items())
+        return f"{self.__class__.__name__}({args})"
 
 
-def get_corruption_attacks(subset: Union[Tuple[str], str] = ('common',)) -> List[BaseImageCorruptionAttack]:
+class RepeatedRotateImageCorruptionsAttack:
+    """Repeats the wrapped attack and returns the best result"""
+
+    def __init__(self, attack: RotateImageCorruptionsAttack, times: int):
+        if times < 1:
+            raise ValueError(f"expected times >= 1, got {times}")  # pragma: no cover
+
+        self.attack: RotateImageCorruptionsAttack = attack
+        self.times: int = times
+
+    def __call__(  # noqa: F811
+            self,
+            model: Model,
+            inputs: T,
+            criterion: TargetedMisclassification,
+            *,
+            severities: Union[Sequence[int], int, None],
+            check_trivial: bool = True,
+            **kwargs: Any,
+    ) -> Tuple[T, T, T, T]:
+        x, restore_type = ep.astensor_(inputs)
+        seed: Optional[int] = kwargs.pop('seed', None)
+
+        del inputs
+
+        target_classes = criterion.target_classes
+        criterion_ = get_criterion(criterion)
+        is_adversarial = get_is_adversarial(criterion_, model)
+
+        if seed is not None:
+            np.random.seed(seed)
+
+        if not isinstance(severities, Iterable):
+            severities = [severities]
+
+        N = len(x)
+        K = len(severities)
+
+        result = x
+        if check_trivial:
+            found = is_adversarial(result)
+        else:
+            found = ep.zeros(x, len(result)).bool()
+        result_distance = -1 * ep.where(found, 0., ep.nan)  # 0: trivial adversarial, nan: no adversarial
+        result_attack = -1 * ep.where(found, -1., ep.nan)  # -1: trivial adversarial, nan: no adversarial
+
+        num_attacks = len(self.attack.attacks)
+        attack_permutation = ep.from_numpy(found,
+                                           np.stack([np.random.permutation(num_attacks) for _ in range(len(x))]))
+        kwargs['attack_permutation'] = attack_permutation
+
+        for i in range(self.times):
+
+            if found.all():
+                break
+
+            not_found = ep.logical_not(found)
+
+            # run the attack
+            criterion_ = criterion
+            criterion_.target_classes = target_classes[not_found]
+            is_adversarial = get_is_adversarial(criterion_, model)
+            kwargs['attack_permutation'] = attack_permutation[not_found, :]
+            xps, success, distance, attack = self.run(
+                model,
+                x[not_found],
+                criterion_, severities=severities, **kwargs
+            )
+            assert logical_xor(is_adversarial(xps), success).all()
+
+            n = ep.logical_not(found).sum()
+            assert len(xps) == n
+            assert success.shape == (n,)
+            assert distance.shape == (n,)
+            assert attack.shape == (n,)
+
+            # upscale new successes
+            is_adv = np.zeros_like(found, dtype=np.bool)
+            is_adv[not_found.numpy()] = success.bool().numpy()
+            is_adv = ep.from_numpy(found, is_adv)
+            is_new_adv = ep.logical_and(is_adv, not_found)
+            
+            # upscale adversarial examples
+            xps_ = np.zeros_like(x.numpy())
+            xps_[is_adv.numpy()] = xps[success.bool()].numpy()
+            xps_ = ep.from_numpy(found, xps_)
+
+            # upscale new distances
+            new_distances = np.ones_like(is_new_adv.numpy(), dtype='float32') * np.nan
+            new_distances[not_found.numpy()] = distance.numpy()
+            new_distances = ep.from_numpy(found, new_distances)
+
+            # upscale new attacks
+            new_attacks = np.ones_like(is_new_adv.numpy(), dtype='float32') * np.nan
+            new_attacks[not_found.numpy()] = attack.numpy()
+            new_attacks = ep.from_numpy(found, new_attacks)
+
+            result = ep.where(atleast_kd(is_new_adv, xps_.ndim), xps_, result)
+            result_distance = ep.where(atleast_kd(is_new_adv, distance.ndim),
+                                       new_distances,
+                                       result_distance)
+            result_attack = ep.where(atleast_kd(is_new_adv, attack.ndim),
+                                     new_attacks,
+                                     result_attack)
+            found = ep.logical_or(found, is_adv)
+
+        result = restore_type(result)
+        result_distance = restore_type(result_distance)
+        result_attack = restore_type(result_attack)
+
+        return result, restore_type(found), result_distance, result_attack
+
+    def run(self,
+            model: Model,
+            inputs: T,
+            criterion: TargetedMisclassification,
+            *,
+            severities: Sequence[int],
+            **kwargs) -> Tuple[T, T, T, T]:
+
+        attack_permutation: Optional[torch.tensor] = kwargs.pop('attack_permutation', None)
+        adv, success, distance, attack = self.attack(
+            model, inputs, criterion, severities=severities, attack_permutation=attack_permutation, **kwargs
+        )
+
+        return adv, success, distance, attack
+
+    def repeat(self, times: int) -> "RepeatedRotateImageCorruptionsAttack":
+        return RepeatedRotateImageCorruptionsAttack(self, self.times * times)
+
+
+def get_corruption_attacks(subset: Union[Tuple[str], str] = ('common',)) -> List[ImageCorruptionAttack]:
     """
 
     Retrieves classes for specified subset of corruption attacks. Note: identifiers 'common', 'all', 'validation' take
